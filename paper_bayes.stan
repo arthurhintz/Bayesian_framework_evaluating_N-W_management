@@ -9,24 +9,6 @@ functions {
   real SL(real a, real y, real psi) {
      return (psi * (a - y)) ^ 2;
   }
-  
-  // PTL potential function
-  real PTL(real a, real y, real psi) {
-    return pow(abs(a - y), (psi-1));
-  }
-  
-  // Potential asymetric
-  real ASY_POT(real a, real y, real psi){
-
-  real r = a - y;
-
-  if (a > 0)
-    return -2 * psi * pow(abs(r), 0.75);
-  else
-    //return -8 * psi * pow(abs(r), 0.75);
-    return exp(psi * (r));
-  }
-
 }
 
 
@@ -41,12 +23,12 @@ data {
 
   //x-data
   vector[N] x1; //Nitrogen
-  vector[N] x2; //Irrigation
+  vector[N] x2; //Water
   
   real psi; 
   
   vector[N_test] act_x1; //N test
-  vector[N_test] act_x2; //I test  
+  vector[N_test] act_x2; //W test  
 }
 
 
@@ -159,11 +141,9 @@ generated quantities {
 
   // profit loss
   loss_linex[i] = LINEX(grid_pred[i], profit_opt, psi);
-  loss_ptl[i] = ASY_POT(grid_pred[i], profit_opt, psi);
   loss_sl[i] = SL(grid_pred[i], profit_opt, psi); 
   
   }  
-  
 }
 
 
