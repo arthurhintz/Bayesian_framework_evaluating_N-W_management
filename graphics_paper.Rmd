@@ -1,0 +1,550 @@
+---
+title: "Graphics Paper"
+author: "Hintz A."
+date: "2026-08-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Setup
+
+## Packages
+
+```{r packages}
+library(tidyverse)   # data wrangling and ggplot2
+library(cmdstanr)    # Stan interface
+library(posterior)   # draws handling
+library(metR)        # contour labels
+library(patchwork)   # inset_element()
+library(sp)          # point.in.polygon()
+library(ks)          # kernel density estimation (credible region)
+```
+
+## Paths
+
+```{r paths}
+data_file  <- "simu_data.csv"
+stan_file  <- "paper_bayes.stan"
+fig_dir    <- "figures"
+
+dir.create(fig_dir, showWarnings = FALSE)
+```
+
+## Helper functions
+
+```{r helpers}
+# Back-transform standardized values to the original scale
+unscale <- function(x, value) {
+  x <- x[!is.na(x)]
+  value * sd(x) + mean(x)
+}
+
+# Unit conversions
+lbac_to_kgha <- function(lb)     lb * 1.125       # lb/ac -> kg/ha
+in_to_mm     <- function(inches) inches * 25.4    # in -> mm
+
+# Loss functions (used only to illustrate the loss shapes)
+sq_loss    <- function(psi, a, y) (psi * (a - y))^2
+linex_loss <- function(psi, a, y) exp(psi * (a - y)) - psi * (a - y) - 1
+```
+
+## Plot theme and labels
+
+```{r theme}
+labs_std <- labs(
+  x = expression("Total N fert. (kg" %.% "ha"^{-1}*")"),
+  y = expression("Total water (mm" %.% "season"^{-1}*")")
+)
+
+theme_std <- function(legend.position = "bottom", base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor  = element_blank(),
+      panel.border      = element_rect(fill = NA, linewidth = 0.5),
+      legend.position   = legend.position,
+      legend.title      = element_blank(),
+      legend.margin     = margin(0, 0, 0, -10),
+      legend.box.margin = margin(t = -4),
+      legend.key.size   = unit(0.5, "cm"),
+      axis.text.x       = element_text(hjust = 0.5),
+      axis.title        = element_text(size = 8),
+      axis.text         = element_text(size = 7),
+      legend.text       = element_text(size = 7),
+      plot.margin       = margin(2, 2, 2, 2)
+    )
+}
+```
+
+# Data and prediction grid
+
+```{r data}
+df <- read_csv(data_file) |>
+  mutate(
+    x1 = as.numeric(scale(N)),      # standardized N
+    x2 = as.numeric(scale(water))   # standardized water
+  )
+
+summary(df)
+
+# Prediction grid (standardized scale)
+grid_N <- seq(min(df$x1), max(df$x1), length.out = 100)
+grid_W <- seq(min(df$x2), max(df$x2), length.out = 100)
+grid   <- expand.grid(x1 = grid_N, x2 = grid_W)
+
+data_stan <- list(
+  N      = nrow(df),
+  N_test = nrow(grid),
+  K      = length(unique(df$year)),
+  year   = df$year,
+  y      = df$profit,
+  x1     = df$x1,
+  x2     = df$x2,
+  act_x1 = grid$x1,
+  act_x2 = grid$x2,
+  psi    = -0.005
+)
+```
+
+## Axis breaks and labels (original units)
+
+```{r axes}
+idx <- round(seq(1, 100, length.out = 10))
+
+N_breaks_std <- grid_N[idx]
+W_breaks_std <- grid_W[idx]
+
+N_labels <- unscale(df$N, N_breaks_std) |> lbac_to_kgha() |> round()
+W_labels <- unscale(df$water, W_breaks_std) |> in_to_mm() |> round()
+
+scale_x_std <- scale_x_continuous(
+  limits = range(N_breaks_std),
+  breaks = N_breaks_std, labels = N_labels,
+  expand = c(0, 0)
+)
+
+scale_y_std <- scale_y_continuous(
+  breaks = W_breaks_std, labels = W_labels,
+  expand = c(0, 0)
+)
+```
+
+# Model
+
+```{r model, results='hide'}
+model <- cmdstan_model(stan_file)
+
+fit <- model$sample(
+  data            = data_stan,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 2000,
+  iter_sampling   = 1000,
+  seed            = 1248,
+  refresh         = 500,
+  max_treedepth   = 12,
+  adapt_delta     = 0.98,
+  show_messages   = FALSE,
+  show_exceptions = FALSE
+)
+```
+
+## Posterior summary
+
+```{r posterior-summary}
+summ <- fit$summary(c("x_s", "eigen_val", "eigen_vec",
+                      "b0", "b1", "b2", "b3", "b4", "b5",
+                      "sigma", "alpha"))
+summ
+
+df_draws <- as_draws_df(fit)
+```
+
+# Canonical analysis
+
+## Stationary points
+
+```{r stationary-points}
+xs_draws <- df_draws |>
+  select(N = `x_s[1]`, W = `x_s[2]`)
+
+summary(xs_draws)
+
+xs_mean <- xs_draws |> summarise(N = mean(N), W = mean(W))
+xs_N <- xs_mean$N
+xs_W <- xs_mean$W
+
+# 95% credible region of the stationary point (kernel density contour)
+kd <- ks::kde(xs_draws, compute.cont = TRUE)
+
+contour_95 <- with(kd, contourLines(x = eval.points[[1]],
+                                    y = eval.points[[2]],
+                                    z = estimate,
+                                    levels = cont["5%"])[[1]]) |>
+  as.data.frame()
+
+ggplot() +
+  geom_point(data = xs_draws, aes(x = N, y = W),
+             alpha = 0.15, color = "darkcyan", size = 1) +
+  annotate("point", x = xs_N, y = xs_W,
+           color = "red", size = 4, shape = 4, stroke = 1.5) +
+  geom_path(data = contour_95, aes(x, y),
+            color = "darkred", linewidth = 0.5) +
+  scale_x_continuous(limits = c(-3, 3), breaks = -3:3) +
+  scale_y_continuous(limits = c(-3, 3), breaks = -3:3) +
+  coord_fixed() +
+  labs_std +
+  theme_minimal()
+```
+
+## Ridge (canonical) axes
+
+```{r ridge-axes}
+v1 <- summ |> filter(variable %in% c("eigen_vec[1,1]", "eigen_vec[2,1]")) |> pull(median)
+v2 <- summ |> filter(variable %in% c("eigen_vec[1,2]", "eigen_vec[2,2]")) |> pull(median)
+
+s <- seq(min(grid_N), max(grid_N), length.out = 100)
+
+x_lim <- range(N_breaks_std)
+y_lim <- range(W_breaks_std)
+
+lines_canonical <- bind_rows(
+  data.frame(N = xs_N + s * v1[1], W = xs_W + s * v1[2], axis = "w1"),
+  data.frame(N = xs_N + s * v2[1], W = xs_W + s * v2[2], axis = "w2")
+) |>
+  filter(N >= x_lim[1], N <= x_lim[2],
+         W >= y_lim[1], W <= y_lim[2])
+```
+
+# Posterior predictions on the grid
+
+```{r grid-predictions}
+grid_pred   <- fit$draws("grid_pred", format = "matrix")
+profit_pred <- apply(grid_pred, 2, mean) * 2.471   # $/ac -> $/ha
+bayes_sd    <- apply(grid_pred, 2, sd)
+
+linex <- fit$draws("loss_linex", format = "matrix") |> colMeans()
+ptl   <- fit$draws("loss_ptl",   format = "matrix") |> colMeans()
+sl    <- fit$draws("loss_sl",    format = "matrix") |> colMeans()
+
+grid_data <- cbind(grid, profit_pred, bayes_sd, linex, ptl, sl)
+
+# Flag grid cells inside the 95% credible region
+grid_data$inside_contour <- sp::point.in.polygon(
+  point.x = grid_data$x1,
+  point.y = grid_data$x2,
+  pol.x   = contour_95$x,
+  pol.y   = contour_95$y
+) > 0
+```
+
+# Figures
+
+## Response surface
+
+```{r fig-rsm}
+points_labeled <- tibble(
+  point = c("A1", "B1", "A2", "B2"),
+  N_p   = c(2.95, -1.55, 0.5, 1.3),
+  W_p   = c(1.95, 0.6, 2.6, -0.1)
+)
+
+plot_rsm <- ggplot() +
+  geom_path(data = lines_canonical,
+            aes(x = N, y = W, colour = axis, group = axis),
+            linewidth = 1.0) +
+  geom_contour(data = grid_data,
+               aes(x = x1, y = x2, z = profit_pred, colour = "expected profit"),
+               alpha = 0.85) +
+  geom_text_contour(data = grid_data,
+                    aes(x = x1, y = x2, z = profit_pred),
+                    colour = "black", size = 2.5, skip = 0,
+                    nudge_y = 0.1, nudge_x = -0.1) +
+  geom_path(data = contour_95, aes(x, y, colour = "CI"), linewidth = 0.5) +
+  annotate("point", x = xs_N, y = xs_W,
+           color = "darkred", size = 2.5, shape = 16) +
+  geom_point(data = points_labeled, aes(x = N_p, y = W_p), size = 2.1) +
+  geom_text(data = points_labeled, aes(x = N_p, y = W_p, label = point),
+            vjust = -0.7, size = 2.2, hjust = -0.5) +
+  scale_colour_manual(
+    name   = NULL,
+    values = c("expected profit" = "black",
+               "CI"              = "darkred",
+               "w1"              = "#E69F00",
+               "w2"              = "#CC79A7"),
+    labels = c("expected profit" = "Expected profit",
+               "CI"              = "95% credible interval",
+               "w1"              = expression(w[1]),
+               "w2"              = expression(w[2])),
+    guide = guide_legend(override.aes = list(linetype  = rep("solid", 4),
+                                             linewidth = rep(0.8, 4)))) +
+  coord_fixed(clip = "on") +
+  scale_x_std +
+  scale_y_std +
+  labs_std +
+  theme_std()
+
+plot_rsm
+```
+
+## Profit, uncertainty and credible region
+
+```{r fig-profit-sd}
+plot_profit_sd <- ggplot() +
+  geom_raster(data = subset(grid_data,
+                            profit_pred >= 600 & bayes_sd <= 15 & inside_contour),
+              aes(x = x1, y = x2), fill = "palegreen", alpha = 0.8) +
+  geom_contour(data = grid_data,
+               aes(x = x1, y = x2, z = profit_pred, colour = "E(Profit)"),
+               alpha = 0.65) +
+  geom_contour(data = grid_data,
+               aes(x = x1, y = x2, z = bayes_sd, colour = "SD(Profit)"),
+               linetype = "dashed", alpha = 0.85, breaks = seq(0, 120, 15)) +
+  geom_text_contour(data = grid_data,
+                    aes(x = x1, y = x2, z = bayes_sd),
+                    colour = "black", size = 2.5, skip = 0, nudge_y = 0.15,
+                    breaks = seq(0, 120, 15),
+                    label.placer = label_placer_fraction(frac = 0.5)) +
+  geom_path(data = contour_95, aes(x, y, colour = "CI"), linewidth = 0.5) +
+  scale_colour_manual(
+    name   = NULL,
+    values = c("E(Profit)" = "black", "CI" = "darkred", "SD(Profit)" = "black"),
+    labels = c("E(Profit)"  = "Expected profit",
+               "CI"         = "95% credible interval",
+               "SD(Profit)" = "Standard deviation"),
+    guide = guide_legend(override.aes = list(
+      linetype  = c("solid", "solid", "dashed"),
+      linewidth = c(0.8, 0.8, 0.8)))) +
+  coord_fixed(clip = "on") +
+  scale_x_std +
+  scale_y_std +
+  labs_std +
+  theme_std()
+
+plot_profit_sd
+```
+
+## Loss functions
+
+```{r}
+y_test <- -400:400
+
+plot_loss_fn <- data.frame(
+  action = y_test,
+  square = sq_loss(psi = -0.005, a = y_test, y = 200),
+  linex  = linex_loss(psi = -0.005, a = y_test, y = 200)
+) |>
+  ggplot(aes(action)) +
+  geom_line(aes(y = square, color = "Square"), linewidth = 1) +
+  geom_line(aes(y = linex,  color = "Linex"),  linewidth = 1) +
+  scale_color_manual(values = c("Square" = "#0072B2", "Linex" = "black")) +
+  labs(x = expression("Expected profit ($" %.% "ha"^{-1}*")"),
+       y = "Loss", color = "Loss function") +
+  theme_std()
+
+plot_loss_fn
+```
+
+## Linex loss maps
+
+```{r fig-loss-maps}
+# Shared color scale (quantiles of the linex loss)
+loss_qs     <- quantile(grid_data$linex, probs = c(0, .25, .5, .75, 1), na.rm = TRUE)
+loss_colors <- c("#004588", "#115594", "gray", "#ee3229", "#8d191c")
+
+scale_fill_loss <- scale_fill_gradientn(
+  name    = "Loss",
+  colours = loss_colors,
+  values  = scales::rescale(loss_qs, to = c(0, 1)),
+  limits  = range(loss_qs),
+  breaks  = range(loss_qs),
+  guide   = "none"
+)
+
+# Custom color-bar legend (low/high risk)
+legend_df <- data.frame(ymin = 0:4, ymax = 1:5, fill = loss_colors)
+
+p_legend <- ggplot(legend_df) +
+  geom_rect(aes(xmin = 0, xmax = 0.35, ymin = ymin, ymax = ymax, fill = fill)) +
+  scale_fill_identity() +
+  annotate("text", x = 0.45, y = 4.9, label = "High risk", hjust = 0, size = 2.5) +
+  annotate("text", x = 0.45, y = 0.1, label = "Low risk",  hjust = 0, size = 2.5) +
+  coord_cartesian(xlim = c(0, 1.6), ylim = c(0, 5), clip = "off", expand = FALSE) +
+  theme_void() +
+  theme(plot.margin = margin(0, 2, 1, 0))
+
+legend_inset <- function(p) {
+  p + inset_element(p_legend, left = 1., right = 1.17, bottom = 0.25, top = 0.75)
+}
+
+# (a) Loss + expected profit
+p_loss_a <- ggplot(grid_data, aes(x = x1, y = x2)) +
+  geom_raster(aes(fill = linex), interpolate = TRUE) +
+  scale_fill_loss +
+  geom_contour(aes(z = profit_pred, color = "E"), alpha = 0.85) +
+  geom_text_contour(aes(z = profit_pred),
+                    colour = "black", size = 2.5, skip = 0,
+                    nudge_y = 0.1, nudge_x = -0.1) +
+  scale_color_manual(
+    name   = NULL,
+    values = c("E" = "black"),
+    labels = c("E" = "Expected profit"),
+    guide  = guide_legend(override.aes = list(linetype = "solid", linewidth = 0.8))) +
+  coord_fixed(clip = "on") +
+  scale_x_std +
+  scale_y_std +
+  labs_std +
+  labs(tag = "a") +
+  theme_std() +
+  theme(plot.margin = margin(1, 0, 1, 0))
+
+# (b) Loss + expected profit + SD
+p_loss_b <- ggplot(grid_data, aes(x = x1, y = x2)) +
+  geom_raster(aes(fill = linex), interpolate = TRUE) +
+  scale_fill_loss +
+  geom_contour(aes(z = profit_pred),
+               colour = "black", linewidth = 0.6, alpha = 0.5) +
+  geom_contour(aes(z = bayes_sd, color = "SD"),
+               breaks = seq(0, 90, 15), linetype = "dashed", linewidth = 0.6) +
+  geom_text_contour(aes(z = bayes_sd), breaks = seq(0, 90, 15),
+                    colour = "black", size = 2.5, nudge_y = 0.2, skip = 0,
+                    label.placer = label_placer_fraction(frac = 0.5)) +
+  scale_color_manual(name   = NULL,
+                     values = c("SD" = "black"),
+                     labels = c("SD" = "Standard deviation")) +
+  coord_fixed(clip = "on") +
+  scale_x_std +
+  scale_y_std +
+  labs_std +
+  labs(tag = "b") +
+  theme_std() +
+  theme(plot.margin = margin(1, 0, 1, 0))
+
+p_loss_a <- legend_inset(p_loss_a)
+p_loss_b <- legend_inset(p_loss_b)
+
+print(p_loss_a)
+print(p_loss_b)
+```
+
+# Efficiency analysis
+
+## N and water use efficiency (NUE, WUE)
+
+```{r efficiency-data}
+grid_eff <- grid_data |>
+  mutate(
+    N_orig = unscale(df$N,     x1),   # original units (lb/ac)
+    W_orig = unscale(df$water, x2),   # original units (in)
+    NUE    = profit_pred / N_orig,
+    WUE    = profit_pred / W_orig
+  ) |>
+  filter(is.finite(NUE), is.finite(WUE)) |>
+  mutate(
+    NUE = case_when(NUE < 0    ~ "Inefficient",
+                    NUE < 3.65 ~ "Low",
+                    TRUE       ~ "High"),
+    WUE = case_when(WUE < 0  ~ "Inefficient",
+                    WUE < 24 ~ "Low",
+                    TRUE     ~ "High"),
+    across(c(NUE, WUE),
+           ~ factor(.x, levels = c("High", "Low", "Inefficient")))
+  )
+```
+
+```{r fig-nue-wue}
+grid_joint <- grid_eff |>
+  mutate(
+    fill_joint = case_when(
+      WUE == "High" & NUE == "High"               ~ "High joint\nefficiency",
+      NUE == "Inefficient" | WUE == "Inefficient" ~ "Inefficient",
+      TRUE                                        ~ "Low\nefficiency"))
+
+plot_nue_wue <- ggplot(grid_joint) +
+  geom_raster(aes(x1, x2, fill = fill_joint)) +
+  scale_fill_manual(
+    name   = "",
+    values = c("High joint\nefficiency" = "#115594",
+               "Low\nefficiency"        = "gray90",
+               "Inefficient"            = "gray45")) +
+  geom_contour(aes(x1, x2, z = as.numeric(NUE == "High"), linetype = "ENP High"),
+               breaks = 0.5, color = "black", linewidth = 0.6) +
+  geom_contour(aes(x1, x2, z = as.numeric(WUE == "High"), linetype = "EWP High"),
+               breaks = 0.5, color = "black", linewidth = 0.6) +
+  scale_linetype_manual(
+    name   = "",
+    values = c("EWP High" = "dotdash", "ENP High" = "dotted")) +
+  guides(
+    fill     = guide_legend(order = 1),
+    linetype = guide_legend(order = 2,
+                            override.aes = list(color = "black", linewidth = 0.8))) +
+  coord_fixed(clip = "on") +
+  scale_x_std +
+  scale_y_std +
+  labs_std +
+  theme_std(legend.position = "right")
+
+plot_nue_wue
+```
+
+## Efficiency, risk and uncertainty
+
+```{r fig-efficiency-risk}
+data_efficiency <- grid_eff |>
+  mutate(
+    loss_high    = linex > 0.05,
+    sd_high      = bayes_sd > 15,
+    ineff        = NUE == "Inefficient" | WUE == "Inefficient",
+    eff_high     = NUE == "High" & WUE == "High",
+    eff_high_num = as.numeric(eff_high),
+    fill_joint = case_when(
+      eff_high  & !loss_high & !sd_high ~ "Optimal region",
+      eff_high  & (loss_high | sd_high) ~ "Efficient but\nrisky",
+      !eff_high & !loss_high & !sd_high ~ "Safe but not\nefficient",
+      ineff                             ~ "Inefficient",
+      TRUE                              ~ "Poor"),
+    fill_joint = factor(fill_joint,
+                        levels = c("Optimal region", "Efficient but\nrisky",
+                                   "Safe but not\nefficient", "Inefficient", "Poor"))
+  )
+
+plot_efficiency <- ggplot(data_efficiency) +
+  geom_raster(aes(x1, x2, fill = fill_joint)) +
+  scale_fill_manual(
+    name   = NULL,
+    values = c("Optimal region"          = "palegreen",
+               "Efficient but\nrisky"    = "#115594",
+               "Safe but not\nefficient" = "orange",
+               "Inefficient"             = "gray45",
+               "Poor"                    = "gray90")) +
+  geom_contour(aes(x1, x2, z = linex, linetype = "Lower risk"),
+               breaks = 0.05, color = "black", linewidth = 0.6) +
+  geom_contour(aes(x1, x2, z = bayes_sd, linetype = "Lower uncertainty"),
+               breaks = 15, color = "black", linewidth = 0.6) +
+  geom_contour(aes(x1, x2, z = eff_high_num, linetype = "High joint\nefficiency"),
+               breaks = 0.5, color = "black", linewidth = 0.6) +
+  scale_linetype_manual(
+    name   = "Contours",
+    values = c("Lower risk"             = "dotted",
+               "Lower uncertainty"      = "dashed",
+               "High joint\nefficiency" = "solid")) +
+  guides(
+    fill     = guide_legend(order = 1),
+    linetype = guide_legend(order = 2,
+                            override.aes = list(color = "black", linewidth = 0.8))) +
+  coord_fixed(clip = "on") +
+  scale_x_std +
+  scale_y_std +
+  labs_std +
+  theme_std(legend.position = "right")
+
+plot_efficiency
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
